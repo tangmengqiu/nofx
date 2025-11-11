@@ -102,7 +102,7 @@ export function ComparisonChart({ traders }: ComparisonChartProps) {
 
         // 计算盈亏百分比：从total_pnl和balance计算
         // 假设初始余额 = balance - total_pnl
-        const initialBalance = point.balance - point.total_pnl
+        const initialBalance = point.total_equity - point.total_pnl
         const pnlPct =
           initialBalance > 0 ? (point.total_pnl / initialBalance) * 100 : 0
 

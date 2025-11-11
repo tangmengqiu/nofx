@@ -486,6 +486,7 @@ func (s *Server) handleCreateTrader(c *gin.Context) {
 	}
 
 	// 生成交易员ID
+	//TODO: 生成交易员ID时, time.Now().Unix() 可能会重复（同一秒内可能会有多个交易员创建）, 需要考虑其他因素确保ID的唯一性
 	traderID := fmt.Sprintf("%s_%s_%d", req.ExchangeID, req.AIModelID, time.Now().Unix())
 
 	// 设置默认值
@@ -530,7 +531,7 @@ func (s *Server) handleCreateTrader(c *gin.Context) {
 		scanIntervalMinutes = 3 // 默认3分钟，且不允许小于3
 	}
 
-	// ✨ 查询交易所实际余额，覆盖用户输入
+	// ✨ 查询交易所实际余额，覆盖用户输入, 如果获取失败，则使用用户输入的初始资金
 	actualBalance := req.InitialBalance // 默认使用用户输入
 	exchanges, err := s.database.GetExchanges(userID)
 	if err != nil {
@@ -583,15 +584,20 @@ func (s *Server) handleCreateTrader(c *gin.Context) {
 				log.Printf("⚠️ 查询交易所余额失败，使用用户输入的初始资金: %v", balanceErr)
 			} else {
 				// 提取可用余额
-				if availableBalance, ok := balanceInfo["available_balance"].(float64); ok && availableBalance > 0 {
-					actualBalance = availableBalance
-					log.Printf("✓ 查询到交易所实际余额: %.2f USDT (用户输入: %.2f USDT)", actualBalance, req.InitialBalance)
-				} else if totalBalance, ok := balanceInfo["balance"].(float64); ok && totalBalance > 0 {
-					// 有些交易所可能只返回 balance 字段
-					actualBalance = totalBalance
-					log.Printf("✓ 查询到交易所实际余额: %.2f USDT (用户输入: %.2f USDT)", actualBalance, req.InitialBalance)
-				} else {
-					log.Printf("⚠️ 无法从余额信息中提取可用余额，使用用户输入的初始资金")
+				totalWalletBalance := 0.0
+				totalUnrealizedProfit := 0.0
+
+				if wallet, ok := balanceInfo["totalWalletBalance"].(float64); ok {
+					totalWalletBalance = wallet
+				}
+				if unrealized, ok := balanceInfo["totalUnrealizedProfit"].(float64); ok {
+					totalUnrealizedProfit = unrealized
+				}
+
+				// Total equity = wallet balance + unrealized P&L
+				totalEquity := totalWalletBalance + totalUnrealizedProfit
+				if totalEquity > 0 {
+					actualBalance = totalEquity
 				}
 			}
 		}
@@ -967,7 +973,7 @@ func (s *Server) handleSyncBalance(c *gin.Context) {
 		actualBalance = totalBalance
 	} else {
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "无法获取可用余额"})
-				return
+		return
 	}
 
 	oldBalance := traderConfig.InitialBalance
@@ -1552,7 +1558,7 @@ func (s *Server) handleEquityHistory(c *gin.Context) {
 	// 如果无法从status获取，且有历史记录，则从第一条记录获取
 	if initialBalance == 0 && len(records) > 0 {
 		// 第一条记录的equity作为初始余额
-		initialBalance = records[0].AccountState.TotalBalance
+		initialBalance = records[0].AccountState.TotalBalance + records[0].AccountState.TotalUnrealizedProfit
 	}
 
 	// 如果还是无法获取，返回错误
@@ -1565,10 +1571,10 @@ func (s *Server) handleEquityHistory(c *gin.Context) {
 
 	var history []EquityPoint
 	for _, record := range records {
-		// TotalBalance字段实际存储的是TotalEquity
-		totalEquity := record.AccountState.TotalBalance
-		// TotalUnrealizedProfit字段实际存储的是TotalPnL（相对初始余额）
-		totalPnL := record.AccountState.TotalUnrealizedProfit
+		walletBalance := record.AccountState.TotalBalance
+		unrealizedPnL := record.AccountState.TotalUnrealizedProfit
+		totalEquity := walletBalance + unrealizedPnL   
+		totalPnL := totalEquity - initialBalance
 
 		// 计算盈亏百分比
 		totalPnLPct := 0.0
@@ -2258,7 +2264,7 @@ func (s *Server) getEquityHistoryForTraders(traderIDs []string) map[string]inter
 			history = append(history, map[string]interface{}{
 				"timestamp":    record.Timestamp,
 				"total_equity": totalEquity,
-				"total_pnl":    record.AccountState.TotalUnrealizedProfit,
+				"total_pnl":    totalEquity - trader.GetInitialBalance(),
 				"balance":      record.AccountState.TotalBalance,
 			})
 		}

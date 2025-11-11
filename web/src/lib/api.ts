@@ -237,7 +237,6 @@ export const api = {
     })
     if (!res.ok) throw new Error('获取账户信息失败')
     const data = await res.json()
-    console.log('Account data fetched:', data)
     return data
   },
 

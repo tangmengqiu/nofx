@@ -25,8 +25,8 @@ import {
 interface EquityPoint {
   timestamp: string
   total_equity: number
-  pnl: number
-  pnl_pct: number
+  total_pnl: number       // ✅ 修正：后端返回的是 total_pnl，不是 pnl
+  total_pnl_pct: number   // ✅ 修正：后端返回的是 total_pnl_pct
   cycle_number: number
 }
 
@@ -116,7 +116,7 @@ export function EquityChart({ traderId }: EquityChartProps) {
   const initialBalance =
     account?.initial_balance || // 从交易员配置读取真实初始余额
     (validHistory[0]
-      ? validHistory[0].total_equity - validHistory[0].pnl
+      ? validHistory[0].total_equity - validHistory[0].total_pnl
       : undefined) || // 备选：淨值 - 盈亏
     1000 // 默认值（与创建交易员时的默认配置一致）
 
@@ -404,7 +404,7 @@ export function EquityChart({ traderId }: EquityChartProps) {
             className="text-xs mb-1 uppercase tracking-wider"
             style={{ color: '#848E9C' }}
           >
-            {t('currentEquity', language)}
+            {t('lastRecordedEquity', language)}
           </div>
           <div
             className="text-xs sm:text-sm font-bold mono"
