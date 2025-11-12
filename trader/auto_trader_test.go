@@ -4,9 +4,11 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"os"
 	"testing"
 	"time"
 
+	"nofx/config"
 	"nofx/decision"
 	"nofx/logger"
 	"nofx/market"
@@ -38,6 +40,10 @@ type AutoTraderTestSuite struct {
 
 	// 测试配置
 	config AutoTraderConfig
+
+	// 测试数据库
+	testDB     *config.Database
+	testDBPath string
 }
 
 // SetupSuite 在整个测试套件开始前执行一次
@@ -69,6 +75,19 @@ func (s *AutoTraderTestSuite) SetupTest() {
 
 	// 创建临时决策日志记录器
 	s.mockLogger = logger.NewDecisionLogger("/tmp/test_decision_logs")
+
+	// 创建临时测试数据库
+	tmpFile, err := os.CreateTemp("", "test_db_*.db")
+	if err != nil {
+		s.T().Fatalf("创建临时数据库文件失败: %v", err)
+	}
+	tmpFile.Close()
+	s.testDBPath = tmpFile.Name()
+	testDB, err := config.NewDatabase(s.testDBPath)
+	if err != nil {
+		s.T().Fatalf("创建测试数据库失败: %v", err)
+	}
+	s.testDB = testDB
 
 	// 设置默认配置
 	s.config = AutoTraderConfig{
@@ -106,7 +125,7 @@ func (s *AutoTraderTestSuite) SetupTest() {
 		stopMonitorCh:         make(chan struct{}),
 		peakPnLCache:          make(map[string]float64),
 		lastBalanceSyncTime:   time.Now(),
-		database:              s.mockDB,
+		database:              s.testDB,
 		userID:                "test_user",
 	}
 }
@@ -116,6 +135,16 @@ func (s *AutoTraderTestSuite) TearDownTest() {
 	// 重置 gomonkey patches
 	if s.patches != nil {
 		s.patches.Reset()
+	}
+
+	// 关闭并清理测试数据库
+	if s.testDB != nil {
+		s.testDB.Close()
+		s.testDB = nil
+	}
+	if s.testDBPath != "" {
+		os.Remove(s.testDBPath)
+		s.testDBPath = ""
 	}
 }
 

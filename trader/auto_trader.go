@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"math"
+	database "nofx/config"
 	"nofx/decision"
 	"nofx/logger"
 	"nofx/market"
@@ -14,6 +15,40 @@ import (
 	"sync"
 	"time"
 )
+
+// ===== PNL 系统数据模型 =====
+
+// Order 订单记录（用于盈亏计算）
+type Order struct {
+	ID                int64   `json:"id"`
+	TraderID          string  `json:"trader_id"`
+	OrderID           string  `json:"order_id"`
+	ClientOrderID     string  `json:"client_order_id"`
+	Symbol            string  `json:"symbol"`
+	Side              string  `json:"side"`               // BUY, SELL
+	PositionSide      string  `json:"position_side"`      // LONG, SHORT
+	ReduceOnly        bool    `json:"reduce_only"`        // 是否平仓单
+	Status            string  `json:"status"`             // FILLED, CANCELED, etc.
+	Quantity          float64 `json:"quantity"`           // 委托数量
+	FilledQuantity    float64 `json:"filled_quantity"`    // 实际成交数量
+	AvgPrice          float64 `json:"avg_price"`          // 成交均价
+	RemainingQuantity float64 `json:"remaining_quantity"` // 剩余未平仓数量（核心字段）
+	RealizedPnL       float64 `json:"realized_pnl"`       // 已实现盈亏
+	Commission        float64 `json:"commission"`         // 手续费（USDT）
+	IsSynthetic       bool    `json:"is_synthetic"`       // 是否为虚拟订单
+	SyncSource        string  `json:"sync_source"`        // NORMAL, EXCHANGE_SYNC, MANUAL_IMPORT
+	CycleNumber       int     `json:"cycle_number"`       // 所属交易周期
+	CreatedAt         string  `json:"created_at"`
+	UpdatedAt         string  `json:"updated_at"`
+}
+
+// Position 仓位信息（从交易所获取）
+type Position struct {
+	Symbol     string  `json:"symbol"`
+	Side       string  `json:"side"`        // LONG, SHORT
+	Quantity   float64 `json:"quantity"`    // 持仓数量（绝对值）
+	EntryPrice float64 `json:"entry_price"` // 成本价
+}
 
 // AutoTraderConfig 自动交易配置（简化版 - AI全权决策）
 type AutoTraderConfig struct {
@@ -105,12 +140,18 @@ type AutoTrader struct {
 	peakPnLCache          map[string]float64 // 最高收益缓存 (symbol -> 峰值盈亏百分比)
 	peakPnLCacheMutex     sync.RWMutex       // 缓存读写锁
 	lastBalanceSyncTime   time.Time          // 上次余额同步时间
-	database              interface{}        // 数据库引用（用于自动更新余额）
+	database              *database.Database // 数据库引用（配置管理 + PNL系统底层连接）
 	userID                string             // 用户ID
+
+	// ===== PNL 系统字段 =====
+	totalRealizedPnL float64      // 累计已实现盈亏（从数据库恢复）
+	totalCommission  float64      // 累计手续费
+	cycleNumber      int          // 当前交易周期编号
+	pnlMutex         sync.RWMutex // PNL 数据读写锁
 }
 
 // NewAutoTrader 创建自动交易器
-func NewAutoTrader(config AutoTraderConfig, database interface{}, userID string) (*AutoTrader, error) {
+func NewAutoTrader(config AutoTraderConfig, database *database.Database, userID string) (*AutoTrader, error) {
 	// 设置默认值
 	if config.ID == "" {
 		config.ID = "default_trader"
@@ -208,7 +249,7 @@ func NewAutoTrader(config AutoTraderConfig, database interface{}, userID string)
 		systemPromptTemplate = "adaptive"
 	}
 
-	return &AutoTrader{
+	at := &AutoTrader{
 		id:                    config.ID,
 		name:                  config.Name,
 		aiModel:               config.AIModel,
@@ -233,7 +274,13 @@ func NewAutoTrader(config AutoTraderConfig, database interface{}, userID string)
 		lastBalanceSyncTime:   time.Now(), // 初始化为当前时间
 		database:              database,
 		userID:                userID,
-	}, nil
+		// PNL 系统字段
+		totalRealizedPnL: 0,
+		totalCommission:  0,
+		cycleNumber:      0,
+	}
+
+	return at, nil
 }
 
 // Run 运行自动交易主循环
@@ -246,6 +293,22 @@ func (at *AutoTrader) Run() error {
 	log.Printf("💰 初始余额: %.2f USDT", at.initialBalance)
 	log.Printf("⚙️  扫描间隔: %v", at.config.ScanInterval)
 	log.Println("🤖 AI将全权决定杠杆、仓位大小、止损止盈等参数")
+
+	// ===== PNL 系统：初始化（仓位同步 + 状态恢复） =====
+	isNewTrader := true
+	hasOrders, err := at.database.PnLHasOrders(at.id)
+	if err != nil {
+		log.Printf("⚠️ [%s] 获取订单记录失败: %v", at.name, err)
+		isNewTrader = true
+	} else {
+		isNewTrader = !hasOrders
+	}
+
+	if err := at.Initialize(isNewTrader); err != nil {
+		log.Printf("⚠️ [%s] PNL系统初始化失败: %v", at.name, err)
+		// 继续运行，但PNL统计可能不准确
+	}
+
 	at.monitorWg.Add(1)
 	defer at.monitorWg.Done()
 
@@ -285,7 +348,6 @@ func (at *AutoTrader) Stop() {
 	at.monitorWg.Wait()     // 等待监控goroutine结束
 	log.Println("⏹ 自动交易系统停止")
 }
-
 
 // runCycle 运行一个交易周期（使用AI全权决策）
 func (at *AutoTrader) runCycle() error {
@@ -727,6 +789,13 @@ func (at *AutoTrader) executeOpenLongWithRecord(decision *decision.Decision, act
 		log.Printf("  ⚠ 设置止盈失败: %v", err)
 	}
 
+	// ===== PNL 系统：记录开仓订单 =====
+	if at.database != nil {
+		if err := at.recordOrderWithRetry(order, decision.Symbol, "LONG", false); err != nil {
+			log.Printf("⚠️ [%s] 记录开仓订单失败: %v", at.name, err)
+		}
+	}
+
 	return nil
 }
 
@@ -807,6 +876,13 @@ func (at *AutoTrader) executeOpenShortWithRecord(decision *decision.Decision, ac
 		log.Printf("  ⚠ 设置止盈失败: %v", err)
 	}
 
+	// ===== PNL 系统：记录开仓订单 =====
+	if at.database != nil {
+		if err := at.recordOrderWithRetry(order, decision.Symbol, "SHORT", false); err != nil {
+			log.Printf("⚠️ [%s] 记录开仓订单失败: %v", at.name, err)
+		}
+	}
+
 	return nil
 }
 
@@ -833,6 +909,14 @@ func (at *AutoTrader) executeCloseLongWithRecord(decision *decision.Decision, ac
 	}
 
 	log.Printf("  ✓ 平仓成功")
+
+	// ===== PNL 系统：计算并记录平仓盈亏 =====
+	if at.database != nil {
+		if err := at.recordCloseOrderWithPnL(order, decision.Symbol, "LONG"); err != nil {
+			log.Printf("⚠️ [%s] 记录平仓盈亏失败: %v", at.name, err)
+		}
+	}
+
 	return nil
 }
 
@@ -859,6 +943,14 @@ func (at *AutoTrader) executeCloseShortWithRecord(decision *decision.Decision, a
 	}
 
 	log.Printf("  ✓ 平仓成功")
+
+	// ===== PNL 系统：计算并记录平仓盈亏 =====
+	if at.database != nil {
+		if err := at.recordCloseOrderWithPnL(order, decision.Symbol, "SHORT"); err != nil {
+			log.Printf("⚠️ [%s] 记录平仓盈亏失败: %v", at.name, err)
+		}
+	}
+
 	return nil
 }
 
@@ -1153,20 +1245,28 @@ func (at *AutoTrader) GetStatus() map[string]interface{} {
 		aiProvider = "Qwen"
 	}
 
+	// 获取 PNL 信息
+	at.pnlMutex.RLock()
+	totalRealizedPnL := at.totalRealizedPnL
+	totalCommission := at.totalCommission
+	at.pnlMutex.RUnlock()
+
 	return map[string]interface{}{
-		"trader_id":       at.id,
-		"trader_name":     at.name,
-		"ai_model":        at.aiModel,
-		"exchange":        at.exchange,
-		"is_running":      at.isRunning,
-		"start_time":      at.startTime.Format(time.RFC3339),
-		"runtime_minutes": int(time.Since(at.startTime).Minutes()),
-		"call_count":      at.callCount,
-		"initial_balance": at.initialBalance,
-		"scan_interval":   at.config.ScanInterval.String(),
-		"stop_until":      at.stopUntil.Format(time.RFC3339),
-		"last_reset_time": at.lastResetTime.Format(time.RFC3339),
-		"ai_provider":     aiProvider,
+		"trader_id":          at.id,
+		"trader_name":        at.name,
+		"ai_model":           at.aiModel,
+		"exchange":           at.exchange,
+		"is_running":         at.isRunning,
+		"start_time":         at.startTime.Format(time.RFC3339),
+		"runtime_minutes":    int(time.Since(at.startTime).Minutes()),
+		"call_count":         at.callCount,
+		"initial_balance":    at.initialBalance,
+		"total_realized_pnl": totalRealizedPnL,
+		"total_commission":   totalCommission,
+		"scan_interval":      at.config.ScanInterval.String(),
+		"stop_until":         at.stopUntil.Format(time.RFC3339),
+		"last_reset_time":    at.lastResetTime.Format(time.RFC3339),
+		"ai_provider":        aiProvider,
 	}
 }
 
@@ -1582,4 +1682,9 @@ func (at *AutoTrader) ClearPeakPnLCache(symbol, side string) {
 // GetInitialBalance 获取初始余额
 func (at *AutoTrader) GetInitialBalance() float64 {
 	return at.initialBalance
+}
+
+// GetUserID 获取用户ID
+func (at *AutoTrader) GetUserID() string {
+	return at.userID
 }

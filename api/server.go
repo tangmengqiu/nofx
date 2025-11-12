@@ -348,25 +348,26 @@ func (s *Server) getTraderFromQuery(c *gin.Context) (*manager.TraderManager, str
 	userID := c.GetString("user_id")
 	traderID := c.Query("trader_id")
 
-	// 确保用户的交易员已加载到内存中
-	err := s.traderManager.LoadUserTraders(s.database, userID)
-	if err != nil {
-		log.Printf("⚠️ 加载用户 %s 的交易员失败: %v", userID, err)
-	}
+	// 【修复】不再每次API调用都重新加载
+	// 交易员应该在启动时加载一次，或在创建/删除时更新
+	// 这避免了每次前端轮询都执行多次数据库查询
 
 	if traderID == "" {
-		// 如果没有指定trader_id，返回该用户的第一个trader
-		ids := s.traderManager.GetTraderIDs()
-		if len(ids) == 0 {
-			return nil, "", fmt.Errorf("没有可用的trader")
+		// 如果没有指定trader_id，从内存中查找该用户的第一个trader
+		allTraders := s.traderManager.GetAllTraders()
+
+		// 遍历找到属于该用户的第一个 trader
+		for id, t := range allTraders {
+			// 通过 trader 的 userID 字段判断所属
+			// 注意：AutoTrader 结构体中有 userID 字段
+			if t.GetUserID() == userID {
+				traderID = id
+				break
+			}
 		}
 
-		// 获取用户的交易员列表，优先返回用户自己的交易员
-		userTraders, err := s.database.GetTraders(userID)
-		if err == nil && len(userTraders) > 0 {
-			traderID = userTraders[0].ID
-		} else {
-			traderID = ids[0]
+		if traderID == "" {
+			return nil, "", fmt.Errorf("用户 %s 没有可用的 trader", userID)
 		}
 	}
 
@@ -583,21 +584,19 @@ func (s *Server) handleCreateTrader(c *gin.Context) {
 			if balanceErr != nil {
 				log.Printf("⚠️ 查询交易所余额失败，使用用户输入的初始资金: %v", balanceErr)
 			} else {
-				// 提取可用余额
+				// ✅ 提取钱包余额（不包含未实现盈亏）
+				// 根据 PNL 系统设计: initial_balance 应该等于系统接管时的 walletBalance
+				// 公式: Equity = InitialBalance + RealizedPnL + UnrealizedPnL
 				totalWalletBalance := 0.0
-				totalUnrealizedProfit := 0.0
 
 				if wallet, ok := balanceInfo["totalWalletBalance"].(float64); ok {
 					totalWalletBalance = wallet
 				}
-				if unrealized, ok := balanceInfo["totalUnrealizedProfit"].(float64); ok {
-					totalUnrealizedProfit = unrealized
-				}
 
-				// Total equity = wallet balance + unrealized P&L
-				totalEquity := totalWalletBalance + totalUnrealizedProfit
-				if totalEquity > 0 {
-					actualBalance = totalEquity
+				// ✅ 使用 walletBalance 而不是 totalEquity
+				if totalWalletBalance > 0 {
+					actualBalance = totalWalletBalance
+					log.Printf("✓ 从交易所查询到钱包余额: %.2f USDT", totalWalletBalance)
 				}
 			}
 		}
@@ -1547,7 +1546,8 @@ func (s *Server) handleEquityHistory(c *gin.Context) {
 		CycleNumber      int     `json:"cycle_number"`
 	}
 
-	// 从AutoTrader获取初始余额（用于计算盈亏百分比）
+	// ✅ 从AutoTrader获取初始余额（用于计算盈亏百分比）
+	// 根据 PNL 系统设计: initial_balance 是系统接管时的 walletBalance（固定值）
 	initialBalance := 0.0
 	if status := trader.GetStatus(); status != nil {
 		if ib, ok := status["initial_balance"].(float64); ok && ib > 0 {
@@ -1555,16 +1555,11 @@ func (s *Server) handleEquityHistory(c *gin.Context) {
 		}
 	}
 
-	// 如果无法从status获取，且有历史记录，则从第一条记录获取
-	if initialBalance == 0 && len(records) > 0 {
-		// 第一条记录的equity作为初始余额
-		initialBalance = records[0].AccountState.TotalBalance + records[0].AccountState.TotalUnrealizedProfit
-	}
-
-	// 如果还是无法获取，返回错误
+	// ✅ 如果无法获取 initial_balance，直接返回错误
+	// 不要使用第一条记录作为 fallback，因为创建时有仓位的情况下会导致计算错误
 	if initialBalance == 0 {
 		c.JSON(http.StatusInternalServerError, gin.H{
-			"error": "无法获取初始余额",
+			"error": "无法获取初始余额，请确保交易员已正确初始化",
 		})
 		return
 	}

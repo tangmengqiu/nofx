@@ -17,6 +17,56 @@ import (
 	_ "modernc.org/sqlite"
 )
 
+// ===== PNL System Types =====
+
+// PnLPositionRow 从 orders 表计算的仓位行
+type PnLPositionRow struct {
+	Symbol     string
+	Side       string
+	Quantity   float64
+	EntryPrice float64
+}
+
+// PnLVirtualOrderInfo 虚拟订单信息
+type PnLVirtualOrderInfo struct {
+	Symbol     string
+	Side       string  // LONG or SHORT
+	Quantity   float64
+	EntryPrice float64
+	Source     string // EXCHANGE_SYNC or MANUAL_IMPORT
+}
+
+// PnLOpenOrderInfo 开仓订单信息
+type PnLOpenOrderInfo struct {
+	OrderID          string
+	ClientOrderID    string
+	Symbol           string
+	Side             string
+	PositionSide     string
+	ReduceOnly       bool
+	Status           string
+	ExecutedQty      float64
+	AvgPrice         float64
+	Commission       float64
+	CycleNumber      int
+	ExchangeResponse map[string]interface{}
+}
+
+// PnLCloseOrderInfo 平仓订单信息
+type PnLCloseOrderInfo struct {
+	OrderID          string
+	ClientOrderID    string
+	Symbol           string
+	Side             string
+	PositionSide     string
+	Status           string
+	ExecutedQty      float64
+	AvgPrice         float64
+	Commission       float64
+	CycleNumber      int
+	ExchangeResponse map[string]interface{}
+}
+
 // DatabaseInterface 定义了数据库实现需要提供的方法集合
 type DatabaseInterface interface {
 	SetCryptoService(cs *crypto.CryptoService)
@@ -50,6 +100,15 @@ type DatabaseInterface interface {
 	UseBetaCode(code, userEmail string) error
 	GetBetaCodeStats() (total, used int, err error)
 	Close() error
+
+	// ===== PNL System Methods =====
+	PnLQueryPositions(traderID string) ([]PnLPositionRow, error)
+	PnLHasOrders(traderID string) (bool, error)
+	PnLCreateVirtualOrdersOnCreation(traderID string, positions []PnLVirtualOrderInfo) error
+	PnLCreateVirtualOrdersOnRuntime(traderID string, positions []PnLVirtualOrderInfo) error
+	PnLRecordOpenOrder(traderID string, orderInfo PnLOpenOrderInfo) error
+	PnLRecordCloseOrder(traderID string, orderInfo PnLCloseOrderInfo, traderName string, logger func(string, ...interface{})) (realizedPnL, commission float64, err error)
+	PnLRestoreState(traderID string) (totalRealized, totalCommission float64, err error)
 }
 
 // Database 配置数据库
@@ -1270,4 +1329,355 @@ func (d *Database) decryptSensitiveData(encrypted string) string {
 	}
 
 	return decrypted
+}
+
+// ===== PNL System Methods =====
+
+// PnLQueryPositions 从 orders 表计算应有持仓
+func (d *Database) PnLQueryPositions(traderID string) ([]PnLPositionRow, error) {
+	rows, err := d.db.Query(`
+		SELECT
+			symbol,
+			position_side,
+			SUM(remaining_quantity) as total_qty,
+			SUM(remaining_quantity * avg_price) / SUM(remaining_quantity) as avg_entry
+		FROM orders
+		WHERE trader_id = ?
+		  AND reduce_only = 0
+		  AND status = 'FILLED'
+		  AND remaining_quantity > 0
+		GROUP BY symbol, position_side
+	`, traderID)
+
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var positions []PnLPositionRow
+	for rows.Next() {
+		var pos PnLPositionRow
+		if err := rows.Scan(&pos.Symbol, &pos.Side, &pos.Quantity, &pos.EntryPrice); err != nil {
+			return nil, err
+		}
+		positions = append(positions, pos)
+	}
+
+	return positions, nil
+}
+
+// PnLHasOrders 检查 trader 是否有订单记录
+func (d *Database) PnLHasOrders(traderID string) (bool, error) {
+	var count int
+	err := d.db.QueryRow(`SELECT COUNT(*) FROM orders WHERE trader_id = ?`, traderID).Scan(&count)
+	if err != nil {
+		return false, err
+	}
+	return count > 0, nil
+}
+
+// PnLCreateVirtualOrdersOnCreation 创建时处理孤儿仓位（创建虚拟订单 + 重置PNL字段）
+// ✅ initial_balance 已在 API 创建时正确设置，此方法不再修改
+func (d *Database) PnLCreateVirtualOrdersOnCreation(traderID string, positions []PnLVirtualOrderInfo) error {
+	tx, err := d.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	// 为每个孤儿仓位创建虚拟订单
+	for _, pos := range positions {
+		if err := d.createVirtualOrderInTx(tx, traderID, pos); err != nil {
+			return err
+		}
+	}
+
+	// ✅ 只重置 PNL 字段，不修改 initial_balance（保持 API 创建时设置的值）
+	_, err = tx.Exec(`
+		UPDATE traders
+		SET total_realized_pnl = 0,
+			total_commission = 0
+		WHERE id = ?
+	`, traderID)
+
+	if err != nil {
+		return err
+	}
+
+	return tx.Commit()
+}
+
+// PnLCreateVirtualOrdersOnRuntime 运行时处理孤儿仓位（用户手动开仓）
+func (d *Database) PnLCreateVirtualOrdersOnRuntime(traderID string, positions []PnLVirtualOrderInfo) error {
+	tx, err := d.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+
+	for _, pos := range positions {
+		if err := d.createVirtualOrderInTx(tx, traderID, pos); err != nil {
+			return err
+		}
+	}
+
+	return tx.Commit()
+}
+
+// createVirtualOrderInTx 在事务中创建虚拟订单（内部辅助方法）
+func (d *Database) createVirtualOrderInTx(tx *sql.Tx, traderID string, pos PnLVirtualOrderInfo) error {
+	syntheticOrderID := fmt.Sprintf("SYNC_%s_%s_%d", pos.Symbol, pos.Side, time.Now().UnixMilli())
+
+	exchangeResponse, _ := json.Marshal(map[string]interface{}{
+		"synthetic": true,
+		"source":    pos.Source,
+		"timestamp": time.Now().Format(time.RFC3339),
+	})
+
+	_, err := tx.Exec(`
+		INSERT INTO orders (
+			trader_id, order_id, client_order_id, symbol, side, position_side,
+			reduce_only, status, quantity, filled_quantity, avg_price,
+			remaining_quantity, realized_pnl, commission,
+			is_synthetic, sync_source, exchange_response
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+	`, traderID, syntheticOrderID, syntheticOrderID, pos.Symbol,
+		"BUY", pos.Side, 0, "FILLED", pos.Quantity, pos.Quantity,
+		pos.EntryPrice, pos.Quantity, 0, 0, 1, pos.Source,
+		string(exchangeResponse))
+
+	return err
+}
+
+// PnLRecordOpenOrder 记录开仓订单
+func (d *Database) PnLRecordOpenOrder(traderID string, orderInfo PnLOpenOrderInfo) error {
+	remainingQty := 0.0
+	if !orderInfo.ReduceOnly {
+		remainingQty = orderInfo.ExecutedQty
+	}
+
+	exchangeResponse, _ := json.Marshal(orderInfo.ExchangeResponse)
+
+	_, err := d.db.Exec(`
+		INSERT INTO orders (
+			trader_id, order_id, client_order_id, symbol, side, position_side,
+			reduce_only, status, quantity, filled_quantity, avg_price,
+			remaining_quantity, realized_pnl, commission,
+			is_synthetic, sync_source,
+			cycle_number, exchange_response
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(client_order_id) DO UPDATE SET
+			status = excluded.status,
+			filled_quantity = excluded.filled_quantity,
+			avg_price = excluded.avg_price,
+			remaining_quantity = excluded.remaining_quantity
+	`, traderID, orderInfo.OrderID, orderInfo.ClientOrderID, orderInfo.Symbol,
+		orderInfo.Side, orderInfo.PositionSide, orderInfo.ReduceOnly, orderInfo.Status,
+		orderInfo.ExecutedQty, orderInfo.ExecutedQty, orderInfo.AvgPrice, remainingQty,
+		0.0, orderInfo.Commission, 0, "NORMAL", orderInfo.CycleNumber, string(exchangeResponse))
+
+	return err
+}
+
+// PnLRecordCloseOrder 记录平仓订单并计算实现盈亏（含 FIFO 匹配）
+func (d *Database) PnLRecordCloseOrder(traderID string, orderInfo PnLCloseOrderInfo, traderName string, logger func(string, ...interface{})) (float64, float64, error) {
+	// 开启事务
+	tx, err := d.db.Begin()
+	if err != nil {
+		return 0, 0, fmt.Errorf("begin transaction failed: %w", err)
+	}
+	defer tx.Rollback()
+
+	// 1. 计算实现盈亏 (FIFO)
+	realizedPnL, err := d.calculateRealizedPnLInTx(tx, traderID, traderName, orderInfo.Symbol, orderInfo.PositionSide, orderInfo.ExecutedQty, orderInfo.AvgPrice, logger)
+	if err != nil {
+		return 0, 0, fmt.Errorf("calculate realized PnL failed: %w", err)
+	}
+
+	if logger != nil {
+		logger("  💰 [%s] 平仓盈亏: %.2f USDT (手续费: %.2f)", traderName, realizedPnL, orderInfo.Commission)
+	}
+
+	// 2. 记录平仓订单
+	exchangeResponse, _ := json.Marshal(orderInfo.ExchangeResponse)
+	_, err = tx.Exec(`
+		INSERT INTO orders (
+			trader_id, order_id, client_order_id, symbol, side, position_side,
+			reduce_only, status, quantity, filled_quantity, avg_price,
+			remaining_quantity, realized_pnl, commission,
+			is_synthetic, sync_source,
+			cycle_number, exchange_response
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(client_order_id) DO UPDATE SET
+			status = excluded.status,
+			filled_quantity = excluded.filled_quantity,
+			avg_price = excluded.avg_price,
+			remaining_quantity = excluded.remaining_quantity,
+			realized_pnl = excluded.realized_pnl
+	`, traderID, orderInfo.OrderID, orderInfo.ClientOrderID, orderInfo.Symbol,
+		orderInfo.Side, orderInfo.PositionSide, 1, orderInfo.Status, orderInfo.ExecutedQty,
+		orderInfo.ExecutedQty, orderInfo.AvgPrice, 0, realizedPnL, orderInfo.Commission,
+		0, "NORMAL", orderInfo.CycleNumber, string(exchangeResponse))
+
+	if err != nil {
+		return 0, 0, fmt.Errorf("insert close order failed: %w", err)
+	}
+
+	// 3. 更新 traders 表的累计值
+	_, err = tx.Exec(`
+		UPDATE traders
+		SET total_realized_pnl = total_realized_pnl + ?,
+		    total_commission = total_commission + ?
+		WHERE id = ?
+	`, realizedPnL, orderInfo.Commission, traderID)
+
+	if err != nil {
+		return 0, 0, fmt.Errorf("update traders failed: %w", err)
+	}
+
+	// 4. 提交事务
+	if err = tx.Commit(); err != nil {
+		return 0, 0, fmt.Errorf("commit transaction failed: %w", err)
+	}
+
+	return realizedPnL, orderInfo.Commission, nil
+}
+
+// calculateRealizedPnLInTx FIFO 匹配算法（在事务中执行）
+func (d *Database) calculateRealizedPnLInTx(
+	tx *sql.Tx,
+	traderID, traderName, symbol, side string,
+	closeQty, closePrice float64,
+	logger func(string, ...interface{}),
+) (float64, error) {
+	// 查询所有有剩余数量的开仓订单（FIFO 顺序）
+	rows, err := tx.Query(`
+		SELECT id, avg_price, remaining_quantity, is_synthetic
+		FROM orders
+		WHERE trader_id = ?
+		  AND symbol = ?
+		  AND position_side = ?
+		  AND reduce_only = 0
+		  AND status = 'FILLED'
+		  AND remaining_quantity > 0
+		ORDER BY created_at ASC
+		FOR UPDATE
+	`, traderID, symbol, side)
+
+	if err != nil {
+		return 0, err
+	}
+	defer rows.Close()
+
+	totalPnL := 0.0
+	remainingCloseQty := closeQty
+
+	// FIFO 匹配并更新
+	for rows.Next() && remainingCloseQty > 0 {
+		var orderID int64
+		var entryPrice, remainingQty float64
+		var isSynthetic bool
+
+		if err := rows.Scan(&orderID, &entryPrice, &remainingQty, &isSynthetic); err != nil {
+			return 0, err
+		}
+
+		// 计算本次匹配数量
+		matchQty := remainingCloseQty
+		if remainingQty < matchQty {
+			matchQty = remainingQty
+		}
+
+		// 计算盈亏
+		var pnl float64
+		if side == "LONG" {
+			pnl = (closePrice - entryPrice) * matchQty
+		} else {
+			pnl = (entryPrice - closePrice) * matchQty
+		}
+
+		totalPnL += pnl
+		remainingCloseQty -= matchQty
+
+		// 更新剩余数量
+		newRemaining := remainingQty - matchQty
+		_, err := tx.Exec(`UPDATE orders SET remaining_quantity = ? WHERE id = ?`,
+			newRemaining, orderID)
+		if err != nil {
+			return 0, err
+		}
+
+		// 日志
+		if logger != nil {
+			synFlag := ""
+			if isSynthetic {
+				synFlag = " [虚拟]"
+			}
+			logger("  📊 [%s] 匹配%s: OrderID=%d, Entry=%.2f, Match=%.4f, PnL=%.2f, Remaining=%.4f",
+				traderName, synFlag, orderID, entryPrice, matchQty, pnl, newRemaining)
+		}
+	}
+
+	if remainingCloseQty > 0.00001 && logger != nil {
+		logger("⚠️ [%s] 平仓数量未完全匹配: 剩余 %.4f", traderName, remainingCloseQty)
+	}
+
+	return totalPnL, nil
+}
+
+// PnLRestoreState 从数据库恢复 PNL 状态（含双重验证）
+func (d *Database) PnLRestoreState(traderID string) (float64, float64, error) {
+	// 1. 从 traders 表读取
+	var totalRealizedPnL, totalCommission float64
+	err := d.db.QueryRow(`
+		SELECT total_realized_pnl, total_commission
+		FROM traders WHERE id = ?
+	`, traderID).Scan(&totalRealizedPnL, &totalCommission)
+
+	if err != nil {
+		return 0, 0, fmt.Errorf("restore failed: %w", err)
+	}
+
+	// 2. 双重验证: 从 orders 表重新计算
+	var dbRealizedPnL, dbCommission float64
+	err = d.db.QueryRow(`
+		SELECT
+			COALESCE(SUM(realized_pnl), 0),
+			COALESCE(SUM(commission), 0)
+		FROM orders
+		WHERE trader_id = ?
+		  AND reduce_only = 1
+		  AND status = 'FILLED'
+	`, traderID).Scan(&dbRealizedPnL, &dbCommission)
+
+	if err != nil {
+		return 0, 0, fmt.Errorf("calculate from orders failed: %w", err)
+	}
+
+	// 3. 严格对账
+	diff := dbRealizedPnL - totalRealizedPnL
+	if diff < 0 {
+		diff = -diff
+	}
+
+	if diff > 0.01 {
+		log.Printf("🚨 [%s] CRITICAL: PnL mismatch!", traderID)
+		log.Printf("   traders.total_realized_pnl = %.8f", totalRealizedPnL)
+		log.Printf("   SUM(orders.realized_pnl)   = %.8f", dbRealizedPnL)
+		log.Printf("   Difference                 = %.8f", diff)
+
+		// 差异过大时阻断
+		if diff > 1.0 {
+			return 0, 0, fmt.Errorf("PnL mismatch too large (%.2f USDT)", diff)
+		}
+
+		// 以 orders 表为准
+		totalRealizedPnL = dbRealizedPnL
+		totalCommission = dbCommission
+
+		d.db.Exec(`UPDATE traders SET total_realized_pnl = ?, total_commission = ? WHERE id = ?`,
+			dbRealizedPnL, dbCommission, traderID)
+	}
+
+	return totalRealizedPnL, totalCommission, nil
 }
