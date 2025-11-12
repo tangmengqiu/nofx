@@ -1,7 +1,6 @@
 package trader
 
 import (
-	"encoding/json"
 	"fmt"
 	"log"
 	"math"
@@ -12,10 +11,8 @@ import (
 
 // ===== PNL 系统 - 仓位同步机制 =====
 
-// syncPositions 仓位同步 - 发现并补齐虚拟订单
-func (at *AutoTrader) syncPositions(isCreation bool) error {
-	log.Printf("🔄 [%s] 开始仓位同步 (isCreation=%v)", at.name, isCreation)
-
+// syncPositionsRuntime 运行时仓位同步 - 检测并处理孤儿仓位（如手动开仓）
+func (at *AutoTrader) syncPositionsRuntime() error {
 	// 1. 从交易所获取当前持仓
 	exchangePositions, err := at.getExchangePositions()
 	if err != nil {
@@ -36,19 +33,15 @@ func (at *AutoTrader) syncPositions(isCreation bool) error {
 		return nil
 	}
 
-	// 4. 发现孤儿仓位 - 告警
-	log.Printf("⚠️ [%s] 发现 %d 个孤儿仓位:", at.name, len(orphans))
+	// 4. 发现孤儿仓位 - 告警（可能是用户手动开仓）
+	log.Printf("⚠️ [%s] 发现 %d 个孤儿仓位（可能是手动开仓）:", at.name, len(orphans))
 	for _, orphan := range orphans {
 		log.Printf("  - %s %s: qty=%.4f, entryPrice=%.2f",
 			orphan.Symbol, orphan.Side, orphan.Quantity, orphan.EntryPrice)
 	}
 
-	// 5. 处理孤儿仓位
-	if isCreation {
-		return at.handleOrphanPositionsOnCreation(orphans)
-	} else {
-		return at.handleOrphanPositionsOnRuntime(orphans)
-	}
+	// 5. 处理孤儿仓位（创建虚拟订单，不重置 PNL 字段）
+	return at.handleOrphanPositionsRuntime(orphans)
 }
 
 // getExchangePositions 从交易所获取持仓
@@ -131,36 +124,9 @@ func (at *AutoTrader) findOrphanPositions(
 	return orphans
 }
 
-// handleOrphanPositionsOnCreation 处理创建时的孤儿仓位
-// ✅ initial_balance 已在 API 创建时设置，此方法只创建虚拟订单
-func (at *AutoTrader) handleOrphanPositionsOnCreation(orphans []Position) error {
-	// 转换为 PnLVirtualOrderInfo 类型
-	virtualOrders := make([]config.PnLVirtualOrderInfo, len(orphans))
-	for i, orphan := range orphans {
-		virtualOrders[i] = config.PnLVirtualOrderInfo{
-			Symbol:     orphan.Symbol,
-			Side:       orphan.Side,
-			Quantity:   orphan.Quantity,
-			EntryPrice: orphan.EntryPrice,
-			Source:     "EXCHANGE_SYNC",
-		}
-	}
-
-	// ✅ 不再传递 walletBalance，不再修改 initial_balance
-	if err := at.database.PnLCreateVirtualOrdersOnCreation(at.id, virtualOrders); err != nil {
-		return err
-	}
-
-	// ✅ 不覆盖 at.initialBalance，保持从数据库加载的值
-	log.Printf("✓ [%s] 创建时有仓位: initial_balance=%.2f (从数据库加载), 已创建 %d 个虚拟订单",
-		at.name, at.initialBalance, len(orphans))
-
-	return nil
-}
-
-// handleOrphanPositionsOnRuntime 处理运行时的孤儿仓位（用户手动开仓）
-func (at *AutoTrader) handleOrphanPositionsOnRuntime(orphans []Position) error {
-	log.Printf("🚨 [%s] CRITICAL: 运行时发现孤儿仓位!", at.name)
+// handleOrphanPositionsRuntime 处理运行时的孤儿仓位（用户手动开仓）
+func (at *AutoTrader) handleOrphanPositionsRuntime(orphans []Position) error {
+	log.Printf("[%s] 运行时发现孤儿仓位!", at.name)
 	log.Printf("   可能原因: 用户手动开仓")
 	log.Printf("   操作: 创建虚拟订单并接管")
 
@@ -177,7 +143,13 @@ func (at *AutoTrader) handleOrphanPositionsOnRuntime(orphans []Position) error {
 	}
 
 	// 使用数据库接口方法
+	log.Printf("🔍 [%s] 准备创建虚拟订单，trader_id=%s, 数量=%d", at.name, at.id, len(virtualOrders))
+	for i, vo := range virtualOrders {
+		log.Printf("   订单%d: %s %s qty=%.4f price=%.2f", i+1, vo.Symbol, vo.Side, vo.Quantity, vo.EntryPrice)
+	}
+
 	if err := at.database.PnLCreateVirtualOrdersOnRuntime(at.id, virtualOrders); err != nil {
+		log.Printf("❌ [%s] 创建虚拟订单失败: %v", at.name, err)
 		return err
 	}
 
@@ -220,22 +192,6 @@ func getFloat64Field(m map[string]interface{}, key string) float64 {
 	return 0
 }
 
-// getBoolField 安全地从 map 中提取 bool 字段
-func getBoolField(m map[string]interface{}, key string) bool {
-	if v, ok := m[key]; ok {
-		if b, ok := v.(bool); ok {
-			return b
-		}
-	}
-	return false
-}
-
-// toJSON 将对象转为 JSON 字符串
-func toJSON(v interface{}) string {
-	b, _ := json.Marshal(v)
-	return string(b)
-}
-
 // ===== PNL 系统 - 辅助函数 =====
 
 // calculateCommissionInUSDT 转换手续费为 USDT
@@ -276,8 +232,11 @@ func (at *AutoTrader) recordOrder(order map[string]interface{}, symbol, position
 	}
 
 	clientOrderID := getStringField(order, "clientOrderId")
+
+	// 提取成交均价（现在 OpenLong/OpenShort 已经查询并返回了 avgPrice）
 	avgPrice := getFloat64Field(order, "avgPrice")
 	if avgPrice == 0 {
+		log.Printf("🚨 [%s] 订单 %s avgPrice=0，order: %+v", at.name, orderID, order)
 		return fmt.Errorf("invalid avgPrice")
 	}
 
@@ -393,14 +352,12 @@ func (at *AutoTrader) recordCloseOrderWithPnL(order map[string]interface{}, symb
 		at.name, at.totalRealizedPnL, realizedPnL, totalCommission)
 
 	return nil
-
-	return fmt.Errorf("database does not support PnL operations")
 }
 
 // ===== PNL 系统 - 启动和恢复 =====
 
-// restoreFromDB 从数据库恢复 PNL 状态
-func (at *AutoTrader) restoreFromDB() error {
+// restorePNLFromDB 从数据库恢复 PNL 状态
+func (at *AutoTrader) restorePNLFromDB() error {
 	// 使用数据库接口方法
 	totalRealizedPnL, totalCommission, err := at.database.PnLRestoreState(at.id)
 	if err != nil {
@@ -445,32 +402,5 @@ func (at *AutoTrader) verifyAccountBalance() error {
 	}
 
 	log.Printf("✓ [%s] 账户对账通过: Equity=%.2f", at.name, calculatedEquity)
-	return nil
-}
-
-// ===== PNL 系统 - 初始化 =====
-
-// Initialize 初始化 PNL 系统（在 trader 启动时调用）
-func (at *AutoTrader) Initialize(isNewTrader bool) error {
-	log.Printf("🔄 [%s] 初始化 PNL 系统...", at.name)
-
-	// 1. 如果不是新创建的 trader，从数据库恢复状态
-	if !isNewTrader {
-		if err := at.restoreFromDB(); err != nil {
-			return fmt.Errorf("恢复 PNL 状态失败: %w", err)
-		}
-	}
-
-	// 2. 执行仓位同步（关键步骤）
-	if err := at.syncPositions(isNewTrader); err != nil {
-		return fmt.Errorf("仓位同步失败: %w", err)
-	}
-
-	// 3. 验证对账
-	if err := at.verifyAccountBalance(); err != nil {
-		log.Printf("⚠️ [%s] 对账验证发现差异: %v", at.name, err)
-	}
-
-	log.Printf("✓ [%s] PNL 系统初始化完成", at.name)
 	return nil
 }

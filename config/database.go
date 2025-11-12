@@ -1409,19 +1409,31 @@ func (d *Database) PnLCreateVirtualOrdersOnCreation(traderID string, positions [
 
 // PnLCreateVirtualOrdersOnRuntime 运行时处理孤儿仓位（用户手动开仓）
 func (d *Database) PnLCreateVirtualOrdersOnRuntime(traderID string, positions []PnLVirtualOrderInfo) error {
+	log.Printf("📊 [DB] PnLCreateVirtualOrdersOnRuntime: trader_id=%s, 订单数=%d", traderID, len(positions))
+
 	tx, err := d.db.Begin()
 	if err != nil {
+		log.Printf("❌ [DB] 开始事务失败: %v", err)
 		return err
 	}
 	defer tx.Rollback()
 
-	for _, pos := range positions {
+	for i, pos := range positions {
+		log.Printf("📊 [DB] 创建虚拟订单 %d/%d: %s %s %.4f@%.2f",
+			i+1, len(positions), pos.Symbol, pos.Side, pos.Quantity, pos.EntryPrice)
 		if err := d.createVirtualOrderInTx(tx, traderID, pos); err != nil {
+			log.Printf("❌ [DB] 创建虚拟订单失败: %v", err)
 			return err
 		}
 	}
 
-	return tx.Commit()
+	log.Printf("✅ [DB] 提交事务...")
+	if err := tx.Commit(); err != nil {
+		log.Printf("❌ [DB] 提交事务失败: %v", err)
+		return err
+	}
+	log.Printf("✅ [DB] 事务提交成功")
+	return nil
 }
 
 // createVirtualOrderInTx 在事务中创建虚拟订单（内部辅助方法）

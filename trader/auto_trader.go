@@ -284,6 +284,7 @@ func NewAutoTrader(config AutoTraderConfig, database *database.Database, userID 
 }
 
 // Run 运行自动交易主循环
+// ✅ 统一逻辑：无论首次启动还是重启，都执行相同的初始化流程
 func (at *AutoTrader) Run() error {
 	at.isRunning = true
 	at.stopMonitorCh = make(chan struct{})
@@ -294,20 +295,30 @@ func (at *AutoTrader) Run() error {
 	log.Printf("⚙️  扫描间隔: %v", at.config.ScanInterval)
 	log.Println("🤖 AI将全权决定杠杆、仓位大小、止损止盈等参数")
 
-	// ===== PNL 系统：初始化（仓位同步 + 状态恢复） =====
-	isNewTrader := true
-	hasOrders, err := at.database.PnLHasOrders(at.id)
-	if err != nil {
-		log.Printf("⚠️ [%s] 获取订单记录失败: %v", at.name, err)
-		isNewTrader = true
-	} else {
-		isNewTrader = !hasOrders
+	// ===== PNL 系统：恢复状态（统一逻辑） =====
+	log.Printf("🔄 [%s] 从数据库恢复 PNL 状态...", at.name)
+	if err := at.restorePNLFromDB(); err != nil {
+		log.Printf("⚠️ [%s] 恢复状态失败: %v，初始化为 0", at.name, err)
+		// 容错处理：初始化为 0
+		at.pnlMutex.Lock()
+		at.totalRealizedPnL = 0
+		at.totalCommission = 0
+		at.pnlMutex.Unlock()
 	}
 
-	if err := at.Initialize(isNewTrader); err != nil {
-		log.Printf("⚠️ [%s] PNL系统初始化失败: %v", at.name, err)
-		// 继续运行，但PNL统计可能不准确
+	// ===== 仓位同步：检测运行时的孤儿仓位（如手动开仓） =====
+	log.Printf("🔄 [%s] 开始仓位同步...", at.name)
+	if err := at.syncPositionsRuntime(); err != nil {
+		log.Printf("⚠️ [%s] 仓位同步失败: %v", at.name, err)
+		// 继续运行，但仓位统计可能不准确
 	}
+
+	// ===== 账户对账验证 =====
+	if err := at.verifyAccountBalance(); err != nil {
+		log.Printf("⚠️ [%s] 对账验证发现差异: %v", at.name, err)
+	}
+
+	log.Printf("✓ [%s] 系统初始化完成，开始交易循环", at.name)
 
 	at.monitorWg.Add(1)
 	defer at.monitorWg.Done()

@@ -731,7 +731,7 @@ func (s *Server) handleUpdateTrader(c *gin.Context) {
 		Name:                 req.Name,
 		AIModelID:            req.AIModelID,
 		ExchangeID:           req.ExchangeID,
-		InitialBalance:       req.InitialBalance,
+		InitialBalance:       req.InitialBalance, //TODO 不让更新
 		BTCETHLeverage:       btcEthLeverage,
 		AltcoinLeverage:      altcoinLeverage,
 		TradingSymbols:       req.TradingSymbols,
@@ -2305,4 +2305,66 @@ func (s *Server) handleGetPublicTraderConfig(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, result)
+}
+
+// ===== 辅助函数 =====
+
+// extractOrphanPositions 提取孤儿仓位（创建时从交易所查询到的持仓）
+func extractOrphanPositions(positions []map[string]interface{}) []config.PnLVirtualOrderInfo {
+	var orphans []config.PnLVirtualOrderInfo
+
+	for _, pos := range positions {
+		// 提取仓位数量
+		var qty float64
+		if posAmt, ok := pos["positionAmt"].(float64); ok {
+			qty = posAmt
+		} else if posAmtStr, ok := pos["positionAmt"].(string); ok {
+			// 尝试从字符串解析
+			if parsed, err := strconv.ParseFloat(posAmtStr, 64); err == nil {
+				qty = parsed
+			}
+		}
+
+		// 跳过空仓
+		if qty == 0 || (qty < 0.00001 && qty > -0.00001) {
+			continue
+		}
+
+		// 确定方向
+		side := "LONG"
+		if qty < 0 {
+			side = "SHORT"
+			qty = -qty // 转为正数
+		}
+
+		// 提取入场价格
+		var entryPrice float64
+		if ep, ok := pos["entryPrice"].(float64); ok {
+			entryPrice = ep
+		} else if epStr, ok := pos["entryPrice"].(string); ok {
+			if parsed, err := strconv.ParseFloat(epStr, 64); err == nil {
+				entryPrice = parsed
+			}
+		}
+
+		// 提取交易对
+		symbol := ""
+		if sym, ok := pos["symbol"].(string); ok {
+			symbol = sym
+		}
+
+		if symbol == "" || entryPrice == 0 {
+			continue // 跳过无效数据
+		}
+
+		orphans = append(orphans, config.PnLVirtualOrderInfo{
+			Symbol:     symbol,
+			Side:       side,
+			Quantity:   qty,
+			EntryPrice: entryPrice,
+			Source:     "CREATION_SYNC", // 标记为创建时同步的仓位
+		})
+	}
+
+	return orphans
 }
