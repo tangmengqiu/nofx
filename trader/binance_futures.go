@@ -360,10 +360,20 @@ func (t *FuturesTrader) OpenLong(symbol string, quantity float64, leverage int) 
 	log.Printf("✓ 开多仓成功: %s 数量: %s", symbol, quantityStr)
 	log.Printf("  订单ID: %d", order.OrderID)
 
+	// 返回完整的订单信息（用于 PNL 系统记录）
 	result := make(map[string]interface{})
 	result["orderId"] = order.OrderID
+	result["clientOrderId"] = order.ClientOrderID
 	result["symbol"] = order.Symbol
-	result["status"] = order.Status
+	result["status"] = string(order.Status)
+	result["side"] = string(order.Side)
+	result["avgPrice"] = order.AvgPrice           // 成交均价
+	result["executedQty"] = order.ExecutedQuantity // 成交数量
+
+	// 手续费信息暂时设为0（后续可优化为查询成交记录）
+	result["commission"] = "0"
+	result["commissionAsset"] = "USDT"
+
 	return result, nil
 }
 
@@ -415,10 +425,20 @@ func (t *FuturesTrader) OpenShort(symbol string, quantity float64, leverage int)
 	log.Printf("✓ 开空仓成功: %s 数量: %s", symbol, quantityStr)
 	log.Printf("  订单ID: %d", order.OrderID)
 
+	// 返回完整的订单信息（用于 PNL 系统记录）
 	result := make(map[string]interface{})
 	result["orderId"] = order.OrderID
+	result["clientOrderId"] = order.ClientOrderID
 	result["symbol"] = order.Symbol
-	result["status"] = order.Status
+	result["status"] = string(order.Status)
+	result["side"] = string(order.Side)
+	result["avgPrice"] = order.AvgPrice           // 成交均价
+	result["executedQty"] = order.ExecutedQuantity // 成交数量
+
+	// 手续费信息暂时设为0（后续可优化为查询成交记录）
+	result["commission"] = "0"
+	result["commissionAsset"] = "USDT"
+
 	return result, nil
 }
 
@@ -470,10 +490,20 @@ func (t *FuturesTrader) CloseLong(symbol string, quantity float64) (map[string]i
 		log.Printf("  ⚠ 取消挂单失败: %v", err)
 	}
 
+	// 返回完整的订单信息（用于 PNL 系统记录）
 	result := make(map[string]interface{})
 	result["orderId"] = order.OrderID
+	result["clientOrderId"] = order.ClientOrderID
 	result["symbol"] = order.Symbol
-	result["status"] = order.Status
+	result["status"] = string(order.Status)
+	result["side"] = string(order.Side)
+	result["avgPrice"] = order.AvgPrice           // 成交均价
+	result["executedQty"] = order.ExecutedQuantity // 成交数量
+
+	// 手续费信息暂时设为0（后续可优化为查询成交记录）
+	result["commission"] = "0"
+	result["commissionAsset"] = "USDT"
+
 	return result, nil
 }
 
@@ -525,10 +555,20 @@ func (t *FuturesTrader) CloseShort(symbol string, quantity float64) (map[string]
 		log.Printf("  ⚠ 取消挂单失败: %v", err)
 	}
 
+	// 返回完整的订单信息（用于 PNL 系统记录）
 	result := make(map[string]interface{})
 	result["orderId"] = order.OrderID
+	result["clientOrderId"] = order.ClientOrderID
 	result["symbol"] = order.Symbol
-	result["status"] = order.Status
+	result["status"] = string(order.Status)
+	result["side"] = string(order.Side)
+	result["avgPrice"] = order.AvgPrice           // 成交均价
+	result["executedQty"] = order.ExecutedQuantity // 成交数量
+
+	// 手续费信息暂时设为0（后续可优化为查询成交记录）
+	result["commission"] = "0"
+	result["commissionAsset"] = "USDT"
+
 	return result, nil
 }
 

@@ -377,17 +377,58 @@ func (t *HyperliquidTrader) OpenLong(symbol string, quantity float64, leverage i
 		ReduceOnly: false,
 	}
 
-	_, err = t.exchange.Order(t.ctx, order, nil)
+	orderStatus, err := t.exchange.Order(t.ctx, order, nil)
 	if err != nil {
 		return nil, fmt.Errorf("开多仓失败: %w", err)
 	}
 
-	log.Printf("✓ 开多仓成功: %s 数量: %.4f", symbol, roundedQuantity)
+	// 检查订单状态
+	if orderStatus.Error != nil {
+		return nil, fmt.Errorf("开多仓失败: %s", *orderStatus.Error)
+	}
 
+	// ✅ 严格验证：只接受立即成交的订单（IOC 特性）
+	if orderStatus.Filled == nil {
+		// 记录详细信息（调试用）
+		if orderStatus.Resting != nil {
+			log.Printf("⚠️ [%s] 订单挂单中（未立即成交），orderID=%d", symbol, orderStatus.Resting.Oid)
+			// 主动取消挂单（避免意外成交）
+			_, cancelErr := t.exchange.Cancel(t.ctx, coin, orderStatus.Resting.Oid)
+			if cancelErr != nil {
+				log.Printf("  ⚠️ 取消挂单失败: %v", cancelErr)
+			} else {
+				log.Printf("  ✓ 已取消挂单")
+			}
+		}
+		return nil, fmt.Errorf("订单未立即成交，可能流动性不足（IOC 订单要求立即成交）")
+	}
+
+	// ✅ 使用真实成交数据
+	realAvgPrice, _ := strconv.ParseFloat(orderStatus.Filled.AvgPx, 64)
+	realQty, _ := strconv.ParseFloat(orderStatus.Filled.TotalSz, 64)
+	orderID := fmt.Sprintf("%d", orderStatus.Filled.Oid)
+
+	// 验证成交数量（可选，但推荐）
+	if absFloat(realQty-roundedQuantity) > 0.0001 {
+		log.Printf("⚠️ [%s] 成交数量不匹配: 预期 %.4f, 实际 %.4f", symbol, roundedQuantity, realQty)
+	}
+
+	log.Printf("✓ 开多仓成功: %s 数量: %.4f, 成交价: %.6f", symbol, realQty, realAvgPrice)
+
+	// 手续费暂时设为 0（与其他交易所保持一致）
+	realFee := 0.0
+
+	// 返回完整的订单信息（用于 PNL 系统记录）
 	result := make(map[string]interface{})
-	result["orderId"] = 0 // Hyperliquid没有返回order ID
+	result["orderId"] = orderID
+	result["clientOrderId"] = ""
 	result["symbol"] = symbol
 	result["status"] = "FILLED"
+	result["side"] = "BUY"
+	result["avgPrice"] = fmt.Sprintf("%.8f", realAvgPrice)   // ✅ 真实成交价
+	result["executedQty"] = fmt.Sprintf("%.8f", realQty)     // ✅ 真实成交量
+	result["commission"] = fmt.Sprintf("%.8f", realFee)      // ✅ 真实手续费
+	result["commissionAsset"] = "USDC"
 
 	return result, nil
 }
@@ -435,17 +476,59 @@ func (t *HyperliquidTrader) OpenShort(symbol string, quantity float64, leverage 
 		ReduceOnly: false,
 	}
 
-	_, err = t.exchange.Order(t.ctx, order, nil)
+	orderStatus, err := t.exchange.Order(t.ctx, order, nil)
 	if err != nil {
 		return nil, fmt.Errorf("开空仓失败: %w", err)
 	}
 
-	log.Printf("✓ 开空仓成功: %s 数量: %.4f", symbol, roundedQuantity)
+	// 检查订单状态
+	if orderStatus.Error != nil {
+		return nil, fmt.Errorf("开空仓失败: %s", *orderStatus.Error)
+	}
 
+	// ✅ 严格验证：只接受立即成交的订单（IOC 特性）
+	if orderStatus.Filled == nil {
+		// 记录详细信息（调试用）
+		if orderStatus.Resting != nil {
+			log.Printf("⚠️ [%s] 订单挂单中（未立即成交），orderID=%d", symbol, orderStatus.Resting.Oid)
+			// 主动取消挂单（避免意外成交）
+			_, cancelErr := t.exchange.Cancel(t.ctx, coin, orderStatus.Resting.Oid)
+			if cancelErr != nil {
+				log.Printf("  ⚠️ 取消挂单失败: %v", cancelErr)
+			} else {
+				log.Printf("  ✓ 已取消挂单")
+			}
+		}
+		return nil, fmt.Errorf("订单未立即成交，可能流动性不足（IOC 订单要求立即成交）")
+	}
+
+	// ✅ 使用真实成交数据
+	realAvgPrice, _ := strconv.ParseFloat(orderStatus.Filled.AvgPx, 64)
+	realQty, _ := strconv.ParseFloat(orderStatus.Filled.TotalSz, 64)
+	orderID := fmt.Sprintf("%d", orderStatus.Filled.Oid)
+
+	// 验证成交数量（可选，但推荐）
+	if absFloat(realQty-roundedQuantity) > 0.0001 {
+		log.Printf("⚠️ [%s] 成交数量不匹配: 预期 %.4f, 实际 %.4f", symbol, roundedQuantity, realQty)
+	}
+
+	log.Printf("✓ 开空仓成功: %s 数量: %.4f, 成交价: %.6f", symbol, realQty, realAvgPrice)
+
+	// 手续费暂时设为 0（与其他交易所保持一致）
+	realFee := 0.0
+
+
+	// 返回完整的订单信息（用于 PNL 系统记录）
 	result := make(map[string]interface{})
-	result["orderId"] = 0
+	result["orderId"] = orderID
+	result["clientOrderId"] = ""
 	result["symbol"] = symbol
 	result["status"] = "FILLED"
+	result["side"] = "SELL"
+	result["avgPrice"] = fmt.Sprintf("%.8f", realAvgPrice)
+	result["executedQty"] = fmt.Sprintf("%.8f", realQty)
+	result["commission"] = fmt.Sprintf("%.8f", realFee)
+	result["commissionAsset"] = "USDC"
 
 	return result, nil
 }
@@ -502,22 +585,63 @@ func (t *HyperliquidTrader) CloseLong(symbol string, quantity float64) (map[stri
 		ReduceOnly: true, // 只平仓，不开新仓
 	}
 
-	_, err = t.exchange.Order(t.ctx, order, nil)
+	orderStatus, err := t.exchange.Order(t.ctx, order, nil)
 	if err != nil {
 		return nil, fmt.Errorf("平多仓失败: %w", err)
 	}
 
-	log.Printf("✓ 平多仓成功: %s 数量: %.4f", symbol, roundedQuantity)
+	// 检查订单状态
+	if orderStatus.Error != nil {
+		return nil, fmt.Errorf("平多仓失败: %s", *orderStatus.Error)
+	}
+
+	// ✅ 严格验证：只接受立即成交的订单（IOC 特性）
+	if orderStatus.Filled == nil {
+		// 记录详细信息（调试用）
+		if orderStatus.Resting != nil {
+			log.Printf("⚠️ [%s] 订单挂单中（未立即成交），orderID=%d", symbol, orderStatus.Resting.Oid)
+			// 主动取消挂单（避免意外成交）
+			_, cancelErr := t.exchange.Cancel(t.ctx, coin, orderStatus.Resting.Oid)
+			if cancelErr != nil {
+				log.Printf("  ⚠️ 取消挂单失败: %v", cancelErr)
+			} else {
+				log.Printf("  ✓ 已取消挂单")
+			}
+		}
+		return nil, fmt.Errorf("订单未立即成交，可能流动性不足（IOC 订单要求立即成交）")
+	}
+
+	// ✅ 使用真实成交数据
+	realAvgPrice, _ := strconv.ParseFloat(orderStatus.Filled.AvgPx, 64)
+	realQty, _ := strconv.ParseFloat(orderStatus.Filled.TotalSz, 64)
+	orderID := fmt.Sprintf("%d", orderStatus.Filled.Oid)
+
+	// 验证成交数量（可选，但推荐）
+	if absFloat(realQty-roundedQuantity) > 0.0001 {
+		log.Printf("⚠️ [%s] 成交数量不匹配: 预期 %.4f, 实际 %.4f", symbol, roundedQuantity, realQty)
+	}
+
+	log.Printf("✓ 平多仓成功: %s 数量: %.4f, 成交价: %.6f", symbol, realQty, realAvgPrice)
+
+	// 手续费暂时设为 0（与其他交易所保持一致）
+	realFee := 0.0
 
 	// 平仓后取消该币种的所有挂单
 	if err := t.CancelAllOrders(symbol); err != nil {
 		log.Printf("  ⚠ 取消挂单失败: %v", err)
 	}
 
+	// 返回完整的订单信息（用于 PNL 系统记录）
 	result := make(map[string]interface{})
-	result["orderId"] = 0
+	result["orderId"] = orderID
+	result["clientOrderId"] = ""
 	result["symbol"] = symbol
 	result["status"] = "FILLED"
+	result["side"] = "SELL"
+	result["avgPrice"] = fmt.Sprintf("%.8f", realAvgPrice)
+	result["executedQty"] = fmt.Sprintf("%.8f", realQty)
+	result["commission"] = fmt.Sprintf("%.8f", realFee)
+	result["commissionAsset"] = "USDC"
 
 	return result, nil
 }
@@ -574,22 +698,63 @@ func (t *HyperliquidTrader) CloseShort(symbol string, quantity float64) (map[str
 		ReduceOnly: true,
 	}
 
-	_, err = t.exchange.Order(t.ctx, order, nil)
+	orderStatus, err := t.exchange.Order(t.ctx, order, nil)
 	if err != nil {
 		return nil, fmt.Errorf("平空仓失败: %w", err)
 	}
 
-	log.Printf("✓ 平空仓成功: %s 数量: %.4f", symbol, roundedQuantity)
+	if orderStatus.Error != nil {
+		return nil, fmt.Errorf("平空仓失败: %s", *orderStatus.Error)
+	}
+
+	// ✅ 严格验证：只接受立即成交的订单（IOC 特性）
+	if orderStatus.Filled == nil {
+		// 记录详细信息（调试用）
+		if orderStatus.Resting != nil {
+			log.Printf("⚠️ [%s] 订单挂单中（未立即成交），orderID=%d", symbol, orderStatus.Resting.Oid)
+			// 主动取消挂单（避免意外成交）
+			_, cancelErr := t.exchange.Cancel(t.ctx, coin, orderStatus.Resting.Oid)
+			if cancelErr != nil {
+				log.Printf("  ⚠️ 取消挂单失败: %v", cancelErr)
+			} else {
+				log.Printf("  ✓ 已取消挂单")
+			}
+		}
+		return nil, fmt.Errorf("订单未立即成交，可能流动性不足（IOC 订单要求立即成交）")
+	}
+
+	// ✅ 使用真实成交数据
+	realAvgPrice, _ := strconv.ParseFloat(orderStatus.Filled.AvgPx, 64)
+	realQty, _ := strconv.ParseFloat(orderStatus.Filled.TotalSz, 64)
+	orderID := fmt.Sprintf("%d", orderStatus.Filled.Oid)
+
+	// 验证成交数量（可选，但推荐）
+	if absFloat(realQty-roundedQuantity) > 0.0001 {
+		log.Printf("⚠️ [%s] 成交数量不匹配: 预期 %.4f, 实际 %.4f", symbol, roundedQuantity, realQty)
+	}
+
+	log.Printf("✓ 平空仓成功: %s 数量: %.4f, 成交价: %.6f", symbol, realQty, realAvgPrice)
 
 	// 平仓后取消该币种的所有挂单
 	if err := t.CancelAllOrders(symbol); err != nil {
 		log.Printf("  ⚠ 取消挂单失败: %v", err)
 	}
 
+	// 手续费暂时设为 0（与其他交易所保持一致）
+	realFee := 0.0
+
+
+	// 返回完整的订单信息（用于 PNL 系统记录）
 	result := make(map[string]interface{})
-	result["orderId"] = 0
+	result["orderId"] = orderID
+	result["clientOrderId"] = ""
 	result["symbol"] = symbol
 	result["status"] = "FILLED"
+	result["side"] = "BUY" // 平空 = BUY
+	result["avgPrice"] = fmt.Sprintf("%.8f", realAvgPrice)
+	result["executedQty"] = fmt.Sprintf("%.8f", realQty)
+	result["commission"] = fmt.Sprintf("%.8f", realFee)
+	result["commissionAsset"] = "USDC"
 
 	return result, nil
 }
@@ -845,6 +1010,7 @@ func (t *HyperliquidTrader) roundPriceToSigfigs(price float64) float64 {
 	rounded := float64(int(price*multiplier+0.5)) / multiplier
 	return rounded
 }
+
 
 // convertSymbolToHyperliquid 将标准symbol转换为Hyperliquid格式
 // 例如: "BTCUSDT" -> "BTC"

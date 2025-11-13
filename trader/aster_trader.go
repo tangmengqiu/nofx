@@ -637,6 +637,18 @@ func (t *AsterTrader) OpenLong(symbol string, quantity float64, leverage int) (m
 		return nil, err
 	}
 
+	// ⚠️ 注意：Aster 使用 LIMIT 订单，可能需要时间成交
+	// 如果 avgPrice 为 0，说明订单尚未成交，PNL 系统可能会报错
+	// 但由于价格设置为 price*1.01，通常会立即成交（类似市价单效果）
+
+	// 补充手续费字段（如果 API 没有返回）
+	if _, exists := result["commission"]; !exists {
+		result["commission"] = "0"
+	}
+	if _, exists := result["commissionAsset"]; !exists {
+		result["commissionAsset"] = "USDT"
+	}
+
 	return result, nil
 }
 
@@ -702,6 +714,14 @@ func (t *AsterTrader) OpenShort(symbol string, quantity float64, leverage int) (
 	var result map[string]interface{}
 	if err := json.Unmarshal(body, &result); err != nil {
 		return nil, err
+	}
+
+	// 补充手续费字段（如果 API 没有返回）
+	if _, exists := result["commission"]; !exists {
+		result["commission"] = "0"
+	}
+	if _, exists := result["commissionAsset"]; !exists {
+		result["commissionAsset"] = "USDT"
 	}
 
 	return result, nil
@@ -786,6 +806,14 @@ func (t *AsterTrader) CloseLong(symbol string, quantity float64) (map[string]int
 		log.Printf("  ⚠ 取消挂单失败: %v", err)
 	}
 
+	// 补充手续费字段（如果 API 没有返回）
+	if _, exists := result["commission"]; !exists {
+		result["commission"] = "0"
+	}
+	if _, exists := result["commissionAsset"]; !exists {
+		result["commissionAsset"] = "USDT"
+	}
+
 	return result, nil
 }
 
@@ -867,6 +895,14 @@ func (t *AsterTrader) CloseShort(symbol string, quantity float64) (map[string]in
 	// 平仓后取消该币种的所有挂单(止损止盈单)
 	if err := t.CancelAllOrders(symbol); err != nil {
 		log.Printf("  ⚠ 取消挂单失败: %v", err)
+	}
+
+	// 补充手续费字段（如果 API 没有返回）
+	if _, exists := result["commission"]; !exists {
+		result["commission"] = "0"
+	}
+	if _, exists := result["commissionAsset"]; !exists {
+		result["commissionAsset"] = "USDT"
 	}
 
 	return result, nil
